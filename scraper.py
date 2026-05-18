@@ -62,13 +62,18 @@ def get_supabase() -> Client:
 def fetch_zefix(canton: str, offset: int = 0, limit: int = 100) -> list:
     url = "https://www.zefix.ch/ZefixREST/api/v1/firm/search.json"
     payload = {
-        "canton": canton,
+        "cantonAbbreviation": canton,
         "activeOnly": True,
         "offset": offset,
         "maxEntries": limit,
+        "legalForms": []
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
     }
     try:
-        r = requests.post(url, json=payload, timeout=15)
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
         r.raise_for_status()
         data = r.json()
         return data.get("list", [])
@@ -148,7 +153,7 @@ def scraper_canton(supabase: Client, canton: str):
             break
 
         offset += limit
-        time.sleep(1)  # Respecter le serveur Zefix
+        time.sleep(1)
 
     print(f"  ✅ {total_ajoute} entreprises ajoutées pour {NOM_CANTON.get(canton, canton)}")
     return total_ajoute
@@ -166,7 +171,7 @@ def main():
     for canton in CANTONS_ROMANDS:
         total = scraper_canton(supabase, canton)
         grand_total += total
-        time.sleep(2)  # Pause entre cantons
+        time.sleep(2)
 
     print("\n" + "=" * 50)
     print(f"✅ Scraping terminé — {grand_total} entreprises ajoutées au total")
