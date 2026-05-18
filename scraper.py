@@ -1,7 +1,7 @@
 """
 ANNUAIRE ROMAND — Agent de scraping
-Cherche des entreprises sur Zefix (registre du commerce suisse)
-et les ajoute automatiquement dans la base de données Supabase.
+Utilise l'API officielle UID du gouvernement suisse
+pour récupérer les entreprises de Suisse romande.
 """
 
 import os
@@ -14,11 +14,8 @@ from datetime import datetime
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Cantons de Suisse romande
-CANTONS_ROMANDS = ["GE", "VD", "VS", "FR", "NE", "JU", "BE"]
-
-# Mapping code canton → nom complet
-NOM_CANTON = {
+# Cantons de Suisse romande avec leurs codes OFS
+CANTONS_ROMANDS = {
     "GE": "Genève",
     "VD": "Vaud",
     "VS": "Valais",
@@ -28,7 +25,7 @@ NOM_CANTON = {
     "BE": "Berne",
 }
 
-# Mapping code NOGA → secteur lisible
+# Mapping NOGA 2 chiffres → secteur
 SECTEURS = {
     "41": "BTP / Construction",
     "42": "BTP / Construction",
@@ -58,64 +55,107 @@ SECTEURS = {
 def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ── Récupérer les entreprises depuis Zefix API ─────────────────
-def fetch_zefix(canton: str, offset: int = 0, limit: int = 100) -> list:
+# ── Appel API UID admin.ch ─────────────────────────────────────
+def fetch_uid_api(canton: str, offset: int = 0, limit: int = 500) -> list:
+    """
+    API SOAP/REST officielle du registre UID suisse.
+    Documentation: https://www.uid.admin.ch/
+    """
+    url = "https://www.uid.admin.ch/TecDocService/TecDocServices.svc/json/SearchByName"
+    params = {
+        "name": "*",
+        "legalSeatCanton": canton,
+        "maxEntries": limit,
+        "firstPosition": offset,
+        "validOnly": "true",
+    }
+    headers = {"Accept": "application/json"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            return data if isinstance(data, list) else []
+        else:
+            print(f"  ⚠ UID API ({canton}): status {r.status_code}")
+            return []
+    except Exception as e:
+        print(f"  ⚠ UID API ({canton}): {e}")
+        return []
+
+# ── Fallback: recherche par nom générique sur Zefix ───────────
+def fetch_zefix_v2(canton: str, offset: int = 0) -> list:
+    """Nouvelle tentative Zefix avec format corrigé."""
     url = "https://www.zefix.ch/ZefixREST/api/v1/firm/search.json"
     payload = {
-        "cantonAbbreviation": canton,
+        "name": "",
+        "languageKey": "fr",
+        "canton": canton,
         "activeOnly": True,
+        "maxEntries": 100,
         "offset": offset,
-        "maxEntries": limit,
-        "legalForms": []
     }
     headers = {
         "Content-Type": "application/json",
-        "Accept": "application/json"
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
     }
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("list", [])
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("list", [])
+        return []
     except Exception as e:
-        print(f"  ⚠ Erreur Zefix ({canton} offset {offset}): {e}")
+        print(f"  ⚠ Zefix v2 ({canton}): {e}")
         return []
 
-# ── Deviner le secteur depuis le code NOGA ─────────────────────
-def get_secteur(firm: dict) -> str:
-    noga = firm.get("nogaCode", "")
-    if noga:
-        prefix = noga[:2]
-        return SECTEURS.get(prefix, "Autre")
-    return "Autre"
+# ── Formater depuis UID API ────────────────────────────────────
+def format_uid(entry: dict, canton_nom: str) -> dict:
+    adresse = entry.get("address", {})
+    noga = entry.get("noga", "")
+    secteur = SECTEURS.get(noga[:2], "Autre") if noga else "Autre"
+    uid = entry.get("uid", {})
+    numero = f"CHE-{uid.get('uidOrganisationId', '')}" if uid else ""
+    return {
+        "nom": entry.get("organisationName", "").strip(),
+        "adresse": adresse.get("street", ""),
+        "npa": str(adresse.get("zipCode", "")),
+        "ville": adresse.get("town", ""),
+        "canton": canton_nom,
+        "secteur": secteur,
+        "numero_ide": numero,
+        "source": "uid.admin.ch",
+        "mis_a_jour": datetime.utcnow().isoformat(),
+    }
 
-# ── Nettoyer et formater une entreprise ───────────────────────
-def format_entreprise(firm: dict, canton: str) -> dict:
+# ── Formater depuis Zefix ──────────────────────────────────────
+def format_zefix(firm: dict, canton_nom: str) -> dict:
     adresse = firm.get("address", {})
+    noga = firm.get("nogaCode", "")
+    secteur = SECTEURS.get(noga[:2], "Autre") if noga else "Autre"
     return {
         "nom": firm.get("name", "").strip(),
         "adresse": adresse.get("street", ""),
         "npa": str(adresse.get("swissZipCode", "")),
         "ville": adresse.get("town", ""),
-        "canton": NOM_CANTON.get(canton, canton),
-        "secteur": get_secteur(firm),
+        "canton": canton_nom,
+        "secteur": secteur,
         "numero_ide": firm.get("uid", ""),
         "source": "zefix.ch",
         "mis_a_jour": datetime.utcnow().isoformat(),
     }
 
-# ── Vérifier si l'entreprise existe déjà (par IDE) ────────────
-def existe_deja(supabase: Client, numero_ide: str) -> bool:
-    if not numero_ide:
-        return False
-    res = supabase.table("entreprises") \
-        .select("id") \
-        .eq("numero_ide", numero_ide) \
-        .execute()
+# ── Vérifier doublon ───────────────────────────────────────────
+def existe_deja(supabase: Client, numero_ide: str, nom: str) -> bool:
+    if numero_ide:
+        res = supabase.table("entreprises").select("id").eq("numero_ide", numero_ide).execute()
+        if res.data:
+            return True
+    res = supabase.table("entreprises").select("id").eq("nom", nom).execute()
     return len(res.data) > 0
 
-# ── Insérer en masse dans Supabase ────────────────────────────
-def inserer_entreprises(supabase: Client, entreprises: list) -> int:
+# ── Insérer par batch ──────────────────────────────────────────
+def inserer(supabase: Client, entreprises: list) -> int:
     if not entreprises:
         return 0
     try:
@@ -125,40 +165,42 @@ def inserer_entreprises(supabase: Client, entreprises: list) -> int:
         print(f"  ⚠ Erreur insertion: {e}")
         return 0
 
-# ── Scraper un canton complet ──────────────────────────────────
-def scraper_canton(supabase: Client, canton: str):
-    print(f"\n📍 Canton {NOM_CANTON.get(canton, canton)}...")
-    offset = 0
-    total_ajoute = 0
-    limit = 100
+# ── Scraper un canton ──────────────────────────────────────────
+def scraper_canton(supabase: Client, canton: str, canton_nom: str) -> int:
+    print(f"\n📍 Canton {canton_nom}...")
+    total = 0
 
-    while True:
-        firms = fetch_zefix(canton, offset, limit)
-        if not firms:
-            break
-
+    # Essai 1 : Zefix v2
+    firms = fetch_zefix_v2(canton)
+    if firms:
+        print(f"  Zefix: {len(firms)} entreprises trouvées")
         nouvelles = []
-        for firm in firms:
-            ide = firm.get("uid", "")
-            if not existe_deja(supabase, ide):
-                e = format_entreprise(firm, canton)
-                if e["nom"]:
-                    nouvelles.append(e)
+        for f in firms:
+            e = format_zefix(f, canton_nom)
+            if e["nom"] and not existe_deja(supabase, e["numero_ide"], e["nom"]):
+                nouvelles.append(e)
+        total += inserer(supabase, nouvelles)
+        print(f"  ✅ {total} ajoutées via Zefix")
+        return total
 
-        ajoute = inserer_entreprises(supabase, nouvelles)
-        total_ajoute += ajoute
-        print(f"  Lot {offset//limit + 1}: {ajoute} nouvelles entreprises ajoutées")
+    # Essai 2 : UID admin.ch
+    print(f"  Zefix indisponible, essai UID admin.ch...")
+    entries = fetch_uid_api(canton)
+    if entries:
+        print(f"  UID API: {len(entries)} entreprises trouvées")
+        nouvelles = []
+        for e in entries:
+            fmt = format_uid(e, canton_nom)
+            if fmt["nom"] and not existe_deja(supabase, fmt["numero_ide"], fmt["nom"]):
+                nouvelles.append(fmt)
+        total += inserer(supabase, nouvelles)
+        print(f"  ✅ {total} ajoutées via UID admin.ch")
+        return total
 
-        if len(firms) < limit:
-            break
+    print(f"  ⚠ Aucune source disponible pour {canton_nom}")
+    return 0
 
-        offset += limit
-        time.sleep(1)
-
-    print(f"  ✅ {total_ajoute} entreprises ajoutées pour {NOM_CANTON.get(canton, canton)}")
-    return total_ajoute
-
-# ── Point d'entrée principal ───────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────
 def main():
     print("=" * 50)
     print("🇨🇭 ANNUAIRE ROMAND — Agent de scraping")
@@ -168,13 +210,13 @@ def main():
     supabase = get_supabase()
     grand_total = 0
 
-    for canton in CANTONS_ROMANDS:
-        total = scraper_canton(supabase, canton)
+    for canton, canton_nom in CANTONS_ROMANDS.items():
+        total = scraper_canton(supabase, canton, canton_nom)
         grand_total += total
         time.sleep(2)
 
     print("\n" + "=" * 50)
-    print(f"✅ Scraping terminé — {grand_total} entreprises ajoutées au total")
+    print(f"✅ Terminé — {grand_total} entreprises ajoutées")
     print("=" * 50)
 
 if __name__ == "__main__":
