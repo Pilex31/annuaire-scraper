@@ -1,6 +1,6 @@
 """
 ANNUAIRE ROMAND — Agent de scraping Zefix authentifié
-Utilise l'API officielle ZefixPublicREST avec credentials.
+Endpoint correct : /company/search
 """
 
 import os
@@ -16,7 +16,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 ZEFIX_USERNAME = os.environ.get("ZEFIX_USERNAME")
 ZEFIX_PASSWORD = os.environ.get("ZEFIX_PASSWORD")
 
-ZEFIX_BASE_URL = "https://www.zefix.admin.ch/ZefixPublicREST/api/v1"
+ZEFIX_BASE = "https://www.zefix.admin.ch/ZefixPublicREST/api/v1"
 
 CANTONS_ROMANDS = {
     "GE": "Genève",
@@ -53,73 +53,49 @@ def get_secteur(noga):
         return SECTEURS.get(str(noga)[:2], "Autre")
     return "Autre"
 
-def fetch_zefix(canton: str, offset: int = 0, max_entries: int = 100) -> list:
+def search_companies(name_prefix: str, canton: str, max_entries: int = 100) -> list:
     """
-    Recherche les entreprises actives d'un canton via l'API Zefix authentifiée.
+    Recherche les entreprises actives via /company/search.
+    On utilise un préfixe de nom pour limiter les résultats.
     """
-    url = f"{ZEFIX_BASE_URL}/firm/search.json"
+    url = f"{ZEFIX_BASE}/company/search"
     payload = {
-        "name": "",
+        "name": name_prefix,
         "languageKey": "fr",
         "canton": canton,
         "activeOnly": True,
         "maxEntries": max_entries,
-        "offset": offset,
+        "offset": 0,
     }
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
     try:
         r = requests.post(url, json=payload, headers=headers, auth=get_auth(), timeout=30)
         if r.status_code == 200:
             return r.json().get("list", [])
-        else:
-            print(f"  ⚠ Zefix ({canton}, offset {offset}): status {r.status_code}")
-            print(f"    Détail: {r.text[:200]}")
-            return []
-    except Exception as e:
-        print(f"  ⚠ Zefix ({canton}): {e}")
+        print(f"  ⚠ {canton}/'{name_prefix}': status {r.status_code}")
+        if r.status_code != 404:
+            print(f"    Détail: {r.text[:300]}")
         return []
-
-def fetch_company_details(ehraid: str) -> dict:
-    """
-    Récupère les détails complets d'une entreprise (incluant NOGA, adresse complète).
-    """
-    if not ehraid:
-        return {}
-    url = f"{ZEFIX_BASE_URL}/company/{ehraid}"
-    try:
-        r = requests.get(url, auth=get_auth(), timeout=15)
-        if r.status_code == 200:
-            return r.json()
-        return {}
-    except:
-        return {}
+    except Exception as e:
+        print(f"  ⚠ Erreur {canton}/'{name_prefix}': {e}")
+        return []
 
 def existe_deja(supabase: Client, numero_ide: str, nom: str) -> bool:
     if numero_ide:
         res = supabase.table("entreprises").select("id").eq("numero_ide", numero_ide).execute()
         if res.data:
             return True
-    res = supabase.table("entreprises").select("id").eq("nom", nom).execute()
-    return len(res.data) > 0
+    return False
 
 def format_entreprise(firm: dict, canton_nom: str) -> dict:
-    """Formate une entreprise depuis la réponse Zefix."""
     adresse = firm.get("address", {})
-    noga = ""
-    # Le code NOGA peut être dans différents champs selon la version
-    if "purpose" in firm:
-        noga = firm.get("nogaCode", "")
-    
     return {
         "nom": firm.get("name", "").strip(),
         "adresse": adresse.get("street", "") or adresse.get("addressLine1", ""),
         "npa": str(adresse.get("swissZipCode", "")),
         "ville": adresse.get("town", "") or adresse.get("city", ""),
         "canton": canton_nom,
-        "secteur": get_secteur(noga),
+        "secteur": "Autre",
         "numero_ide": firm.get("uid", ""),
         "source": "zefix.admin.ch",
         "mis_a_jour": datetime.utcnow().isoformat(),
@@ -137,17 +113,17 @@ def inserer(supabase: Client, entreprises: list) -> int:
 
 def scraper_canton(supabase: Client, canton: str, canton_nom: str) -> int:
     print(f"\n📍 Canton {canton_nom}...")
-    offset = 0
     total_ajoute = 0
-    max_entries = 100
-    max_iterations = 200  # Limite de sécurité
-
-    iteration = 0
-    while iteration < max_iterations:
-        firms = fetch_zefix(canton, offset, max_entries)
+    
+    # On parcourt l'alphabet pour récupérer toutes les entreprises
+    lettres = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+               "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+    
+    for lettre in lettres:
+        firms = search_companies(lettre, canton, max_entries=100)
         if not firms:
-            break
-
+            continue
+        
         nouvelles = []
         for firm in firms:
             ide = firm.get("uid", "")
@@ -156,20 +132,15 @@ def scraper_canton(supabase: Client, canton: str, canton_nom: str) -> int:
                 continue
             if existe_deja(supabase, ide, nom):
                 continue
-            e = format_entreprise(firm, canton_nom)
-            nouvelles.append(e)
-
+            nouvelles.append(format_entreprise(firm, canton_nom))
+        
         ajoute = inserer(supabase, nouvelles)
         total_ajoute += ajoute
-        print(f"  Lot {iteration + 1} (offset {offset}): +{ajoute} ({total_ajoute} total)")
-
-        if len(firms) < max_entries:
-            break
-
-        offset += max_entries
-        iteration += 1
-        time.sleep(0.5)
-
+        if ajoute > 0:
+            print(f"  '{lettre}': +{ajoute} ({total_ajoute} total)")
+        
+        time.sleep(0.3)
+    
     print(f"  ✅ {total_ajoute} entreprises ajoutées pour {canton_nom}")
     return total_ajoute
 
@@ -180,7 +151,7 @@ def main():
     print("=" * 50)
 
     if not ZEFIX_USERNAME or not ZEFIX_PASSWORD:
-        print("❌ ERREUR : ZEFIX_USERNAME ou ZEFIX_PASSWORD manquant !")
+        print("❌ ZEFIX_USERNAME ou ZEFIX_PASSWORD manquant !")
         return
 
     supabase = get_supabase()
