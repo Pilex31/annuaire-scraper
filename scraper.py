@@ -1,6 +1,6 @@
 """
-ANNUAIRE ROMAND — Agent de scraping Zefix authentifié
-Endpoint correct : /company/search
+ANNUAIRE ROMAND — Agent de scraping Zefix v3
+Format de réponse correct + recherche par suffixes courants
 """
 
 import os
@@ -28,19 +28,24 @@ CANTONS_ROMANDS = {
     "BE": "Berne",
 }
 
-SECTEURS = {
-    "41": "BTP / Construction", "42": "BTP / Construction", "43": "BTP / Construction",
-    "68": "Immobilier",
-    "64": "Finance & Assurance", "65": "Finance & Assurance", "66": "Finance & Assurance",
-    "62": "Informatique & Tech", "63": "Informatique & Tech",
-    "86": "Santé", "87": "Santé",
-    "47": "Commerce & Retail", "46": "Commerce & Retail",
-    "56": "Restauration & Hôtellerie", "55": "Restauration & Hôtellerie",
-    "10": "Industrie & Manufacture", "25": "Industrie & Manufacture",
-    "49": "Transport & Logistique", "52": "Transport & Logistique",
-    "85": "Éducation & Formation",
-    "69": "Juridique & Conseil", "70": "Juridique & Conseil",
-}
+# Préfixes/mots fréquents dans les noms d'entreprises suisses (min 3 chars)
+# On combine les formes juridiques + les mots courants pour maximiser la couverture
+TERMES_RECHERCHE = [
+    "SA", "SARL", "AG", "GmbH",  # Formes juridiques courantes
+    "and", "ass", "bel", "bon", "cap", "cer", "com", "con", "dom", "dur",
+    "eco", "edi", "elec", "ent", "esp", "est", "eur", "fid", "fin", "fon",
+    "gar", "gen", "ges", "gra", "gro", "hot", "ide", "imm", "ind", "ins",
+    "int", "inv", "jar", "lac", "lau", "leg", "lib", "log", "mai", "man",
+    "mar", "med", "men", "mer", "min", "mon", "mot", "nat", "neu", "nor",
+    "off", "opt", "org", "par", "pat", "per", "pet", "pha", "pla", "pol",
+    "pre", "pri", "pro", "pub", "qua", "rap", "ref", "reg", "res", "rev",
+    "rou", "san", "sec", "ser", "sit", "sma", "soc", "sol", "spi", "sta",
+    "stu", "sui", "sup", "sys", "tec", "tel", "tem", "ter", "the", "tra",
+    "tri", "uni", "urb", "val", "ver", "via", "vil", "vin", "voy",
+    # Suffixes anglais courants en Suisse
+    "tech", "group", "services", "consulting", "solutions", "partners",
+    "international", "swiss", "holding", "trading",
+]
 
 def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -48,19 +53,11 @@ def get_supabase() -> Client:
 def get_auth():
     return HTTPBasicAuth(ZEFIX_USERNAME, ZEFIX_PASSWORD)
 
-def get_secteur(noga):
-    if noga and len(str(noga)) >= 2:
-        return SECTEURS.get(str(noga)[:2], "Autre")
-    return "Autre"
-
-def search_companies(name_prefix: str, canton: str, max_entries: int = 100) -> list:
-    """
-    Recherche les entreprises actives via /company/search.
-    On utilise un préfixe de nom pour limiter les résultats.
-    """
+def search_companies(name_term: str, canton: str, max_entries: int = 100) -> list:
+    """Recherche les entreprises via /company/search."""
     url = f"{ZEFIX_BASE}/company/search"
     payload = {
-        "name": name_prefix,
+        "name": name_term,
         "languageKey": "fr",
         "canton": canton,
         "activeOnly": True,
@@ -71,32 +68,44 @@ def search_companies(name_prefix: str, canton: str, max_entries: int = 100) -> l
     try:
         r = requests.post(url, json=payload, headers=headers, auth=get_auth(), timeout=30)
         if r.status_code == 200:
-            return r.json().get("list", [])
-        print(f"  ⚠ {canton}/'{name_prefix}': status {r.status_code}")
+            data = r.json()
+            # La réponse est directement une liste (selon le schema)
+            if isinstance(data, list):
+                return data
+            # Ou dans un champ "list"
+            return data.get("list", [])
         if r.status_code != 404:
-            print(f"    Détail: {r.text[:300]}")
+            print(f"  ⚠ {canton}/'{name_term}': status {r.status_code}")
         return []
     except Exception as e:
-        print(f"  ⚠ Erreur {canton}/'{name_prefix}': {e}")
+        print(f"  ⚠ Erreur {canton}/'{name_term}': {e}")
         return []
 
-def existe_deja(supabase: Client, numero_ide: str, nom: str) -> bool:
-    if numero_ide:
-        res = supabase.table("entreprises").select("id").eq("numero_ide", numero_ide).execute()
-        if res.data:
-            return True
-    return False
+def existe_deja(supabase: Client, ide_or_uid: str) -> bool:
+    if not ide_or_uid:
+        return False
+    res = supabase.table("entreprises").select("id").eq("numero_ide", ide_or_uid).execute()
+    return len(res.data) > 0
 
 def format_entreprise(firm: dict, canton_nom: str) -> dict:
-    adresse = firm.get("address", {})
+    """Formate une entreprise selon le schema Zefix réel."""
+    nom = firm.get("name", "").strip()
+    uid = firm.get("uid", "")
+    legal_seat = firm.get("legalSeat", "")  # Ville/commune
+    
+    # Forme juridique en français
+    legal_form = firm.get("legalForm") or {}
+    form_name = legal_form.get("name") or {}
+    forme_jur = form_name.get("fr", "") if isinstance(form_name, dict) else ""
+    
     return {
-        "nom": firm.get("name", "").strip(),
-        "adresse": adresse.get("street", "") or adresse.get("addressLine1", ""),
-        "npa": str(adresse.get("swissZipCode", "")),
-        "ville": adresse.get("town", "") or adresse.get("city", ""),
+        "nom": nom,
+        "adresse": "",  # Pas dans /search, faudrait /company/uid/{id} pour l'avoir
+        "npa": "",
+        "ville": legal_seat,
         "canton": canton_nom,
-        "secteur": "Autre",
-        "numero_ide": firm.get("uid", ""),
+        "secteur": "Autre",  # Pas dans /search non plus
+        "numero_ide": uid,
         "source": "zefix.admin.ch",
         "mis_a_jour": datetime.utcnow().isoformat(),
     }
@@ -108,36 +117,39 @@ def inserer(supabase: Client, entreprises: list) -> int:
         supabase.table("entreprises").insert(entreprises).execute()
         return len(entreprises)
     except Exception as e:
-        print(f"  ⚠ Erreur insertion: {e}")
+        print(f"  ⚠ Erreur insertion: {str(e)[:150]}")
         return 0
 
 def scraper_canton(supabase: Client, canton: str, canton_nom: str) -> int:
     print(f"\n📍 Canton {canton_nom}...")
     total_ajoute = 0
+    uids_vus = set()  # Dédoublonnage en mémoire
     
-    # On parcourt l'alphabet pour récupérer toutes les entreprises
-    lettres = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
-               "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
-    
-    for lettre in lettres:
-        firms = search_companies(lettre, canton, max_entries=100)
+    for terme in TERMES_RECHERCHE:
+        firms = search_companies(terme, canton, max_entries=100)
         if not firms:
             continue
         
         nouvelles = []
         for firm in firms:
-            ide = firm.get("uid", "")
+            uid = firm.get("uid", "")
+            if not uid or uid in uids_vus:
+                continue
+            uids_vus.add(uid)
+            
+            if existe_deja(supabase, uid):
+                continue
+            
             nom = firm.get("name", "").strip()
             if not nom:
                 continue
-            if existe_deja(supabase, ide, nom):
-                continue
+            
             nouvelles.append(format_entreprise(firm, canton_nom))
         
-        ajoute = inserer(supabase, nouvelles)
-        total_ajoute += ajoute
-        if ajoute > 0:
-            print(f"  '{lettre}': +{ajoute} ({total_ajoute} total)")
+        if nouvelles:
+            ajoute = inserer(supabase, nouvelles)
+            total_ajoute += ajoute
+            print(f"  '{terme}' → {len(firms)} résultats, +{ajoute} nouvelles ({total_ajoute} total)")
         
         time.sleep(0.3)
     
@@ -146,7 +158,7 @@ def scraper_canton(supabase: Client, canton: str, canton_nom: str) -> int:
 
 def main():
     print("=" * 50)
-    print("🇨🇭 ANNUAIRE ROMAND — Scraping Zefix authentifié")
+    print("🇨🇭 ANNUAIRE ROMAND — Scraping Zefix v3")
     print(f"   Démarrage : {datetime.now().strftime('%d.%m.%Y %H:%M')}")
     print("=" * 50)
 
