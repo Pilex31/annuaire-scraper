@@ -1,10 +1,12 @@
 """
-ANNUAIRE ROMAND — Agent de scraping v5 (corrigé)
+ANNUAIRE ROMAND — Agent de scraping v6 (sécurisé)
 ─────────────────────────────────────────────────
-Corrections v5 :
-  - Bug d'extraction sur réponse en liste corrigé
-  - Tous les champs Zefix correctement mappés
-  - Nouveau champ : lien vers l'extrait cantonal officiel
+Corrections v6 :
+  - LIMITE STRICTE sur le Flux 2 SOGC (max 20 nouvelles/run)
+  - Le Flux 2 fait un BREAK quand le budget de requêtes est épuisé
+  - GARDE-FOU anti-runs-multiples : si >50 entreprises déjà créées
+    aujourd'hui, le Flux 2 est sauté (le scraper a déjà tourné)
+  - Compteur de requêtes affiché en continu
 """
 
 import os
@@ -29,6 +31,10 @@ ZEFIX_BASE = "https://www.zefix.admin.ch/ZefixPublicREST/api/v1"
 DELAI_ENTRE_REQUETES = 3.0
 MAX_REQUETES_PAR_RUN = 120
 MAX_ENRICHISSEMENTS = 100
+
+# ── Garde-fous v6 pour le Flux 2 (SOGC) ──
+MAX_NOUVELLES_PAR_RUN = 20    # Jamais plus de 20 nouvelles entreprises par run
+SEUIL_ANTI_DOUBLE_RUN = 50    # Si déjà >50 créées aujourd'hui, on saute le Flux 2
 
 CANTONS_ROMANDS = {"GE", "VD", "VS", "FR", "NE", "JU", "BE"}
 CANTONS_NOMS = {
@@ -306,72 +312,115 @@ def flux_1_enrichissement(supabase: Client) -> tuple:
 # FLUX 2 — NOUVELLES INSCRIPTIONS (SOGC)
 # ═══════════════════════════════════════════════════════
 
+def compter_creees_aujourdhui(supabase: Client) -> int:
+    """
+    Garde-fou anti-double-run : compte les entreprises créées aujourd'hui.
+    Si le scraper a déjà tourné, ce nombre sera élevé.
+    """
+    aujourdhui = datetime.now().strftime("%Y-%m-%d")
+    try:
+        res = (
+            supabase.table("entreprises")
+            .select("id", count="exact")
+            .gte("cree_le", f"{aujourdhui}T00:00:00")
+            .execute()
+        )
+        return res.count or 0
+    except Exception as e:
+        log(f"  ⚠ Impossible de compter les créations du jour: {str(e)[:80]}")
+        return 0
+
+
 def flux_2_nouvelles(supabase: Client) -> int:
     log("=" * 50)
     log("📰 FLUX 2 — Nouvelles inscriptions du jour")
     log("=" * 50)
-    
+
+    # ── GARDE-FOU 1 : anti-runs-multiples ──
+    deja_creees = compter_creees_aujourdhui(supabase)
+    if deja_creees > SEUIL_ANTI_DOUBLE_RUN:
+        log(f"  ⛔ {deja_creees} entreprises déjà créées aujourd'hui (seuil: {SEUIL_ANTI_DOUBLE_RUN})")
+        log(f"  ⛔ Le scraper a déjà tourné aujourd'hui. Flux 2 SAUTÉ par sécurité.")
+        return 0
+    log(f"  ✓ {deja_creees} entreprises créées aujourd'hui (sous le seuil, on continue)")
+
     hier = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     log(f"  Recherche des publications du {hier}")
-    
+
     data = call_zefix("GET", f"/sogc/bydate/{hier}")
     if not data:
         log("  ℹ Aucune publication trouvée")
         return 0
-    
+
     publications = data if isinstance(data, list) else data.get("list", [])
-    log(f"  Trouvé {len(publications)} publications")
-    
+    log(f"  Trouvé {len(publications)} publications au total")
+    log(f"  Limite stricte : maximum {MAX_NOUVELLES_PAR_RUN} nouvelles ce run")
+
     ajoutees = 0
+    examinees = 0
+
     for pub in publications:
+        # ── GARDE-FOU 2 : limite dure sur le nombre de nouvelles ──
+        if ajoutees >= MAX_NOUVELLES_PAR_RUN:
+            log(f"  🛑 Limite de {MAX_NOUVELLES_PAR_RUN} nouvelles atteinte. Arrêt du Flux 2.")
+            break
+
+        # ── GARDE-FOU 3 : budget de requêtes Zefix épuisé → BREAK (pas continue) ──
+        if compteur_requetes >= MAX_REQUETES_PAR_RUN:
+            log(f"  🛑 Budget de requêtes épuisé ({compteur_requetes}). Arrêt du Flux 2.")
+            break
+
         if not isinstance(pub, dict):
             continue
-        
+
         canton_pub = (
             pub.get("registryOfCommerceCanton", "")
             or pub.get("canton", "")
         )
-        
         if canton_pub not in CANTONS_ROMANDS:
             continue
-        
-        # Extraire l'UID depuis le message ou les champs
+
         uid = pub.get("uid", "")
         if not uid:
             continue
-        
-        # Vérifier qu'elle n'est pas déjà en base
+
+        # Déjà en base ?
         existe = supabase.table("entreprises").select("id").eq("numero_ide", uid).execute()
         if existe.data:
             continue
-        
+
+        examinees += 1
+
         # Récupérer les détails complets
         response = enrichir_entreprise(uid)
         if not response:
+            # Si c'est la limite de requêtes qui a renvoyé None, on arrête
+            if compteur_requetes >= MAX_REQUETES_PAR_RUN:
+                log(f"  🛑 Budget épuisé pendant l'enrichissement. Arrêt du Flux 2.")
+                break
             continue
-        
+
         donnees = extraire_donnees(response)
         if not donnees:
             continue
-        
-        # Récupérer le nom depuis la réponse
+
         firm = response[0] if isinstance(response, list) and response else response
         nom = firm.get("name", "") if isinstance(firm, dict) else ""
-        
+
         donnees["nom"] = nom
         donnees["numero_ide"] = uid
         donnees["source"] = "zefix.admin.ch (SOGC)"
-        
+
         try:
             supabase.table("entreprises").insert(donnees).execute()
             ajoutees += 1
-            log(f"  ✨ {nom[:50]} ({canton_pub})")
+            log(f"  ✨ [{ajoutees}/{MAX_NOUVELLES_PAR_RUN}] {nom[:50]} ({canton_pub})")
         except Exception as e:
             log(f"  ⚠ Erreur insertion: {str(e)[:100]}")
-        
+
         attendre()
-    
-    log(f"  ✅ {ajoutees} nouvelles entreprises ajoutées")
+
+    log(f"  ✅ {ajoutees} nouvelles entreprises ajoutées ({examinees} examinées)")
     return ajoutees
 
 
@@ -381,27 +430,28 @@ def flux_2_nouvelles(supabase: Client) -> int:
 
 def main():
     log("=" * 50)
-    log("🇨🇭 ANNUAIRE ROMAND — Scraper v5 (corrigé)")
+    log("🇨🇭 ANNUAIRE ROMAND — Scraper v6 (sécurisé)")
     log(f"   {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-    log(f"   Max {MAX_REQUETES_PAR_RUN} req, {DELAI_ENTRE_REQUETES}s entre")
+    log(f"   Max {MAX_REQUETES_PAR_RUN} req Zefix, {DELAI_ENTRE_REQUETES}s entre")
+    log(f"   Flux 2 plafonné à {MAX_NOUVELLES_PAR_RUN} nouvelles/run")
     log("=" * 50)
-    
+
     if not all([SUPABASE_URL, SUPABASE_KEY, ZEFIX_USERNAME, ZEFIX_PASSWORD]):
         log("❌ Variables d'environnement manquantes !")
         return
-    
+
     supabase = get_supabase()
-    
-    # FLUX 1
+
+    # FLUX 1 — Enrichissement
     enrichies, ratees_recup = flux_1_enrichissement(supabase)
-    
-    # FLUX 2 (si budget restant)
+
+    # FLUX 2 — Nouvelles (si budget restant)
     if compteur_requetes < MAX_REQUETES_PAR_RUN - 20:
         nouvelles = flux_2_nouvelles(supabase)
     else:
-        log("⏭ Flux 2 sauté (budget presque épuisé)")
+        log("⏭ Flux 2 sauté (budget de requêtes presque épuisé)")
         nouvelles = 0
-    
+
     # Rapport
     log("=" * 50)
     log("📊 RAPPORT")
