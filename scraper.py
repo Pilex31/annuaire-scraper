@@ -208,18 +208,51 @@ def recuperer_a_enrichir(supabase: Client, limite: int) -> list:
 
 
 def recuperer_ratees(supabase: Client, limite: int) -> list:
-    """Récupère les entreprises marquées enrichie=true mais sans adresse (ratées)."""
-    res = (
-        supabase.table("entreprises")
-        .select("id, nom, numero_ide")
-        .eq("enrichie", True)
-        .or_("adresse.is.null,adresse.eq.")
-        .not_.is_("numero_ide", "null")
-        .neq("numero_ide", "")
-        .limit(limite)
-        .execute()
-    )
-    return res.data
+    """
+    Récupère les entreprises marquées enrichie=true mais sans adresse (ratées).
+    Compatible supabase 1.2.0 : on récupère les fiches enrichies avec
+    adresse vide, puis on filtre les NULL côté Python.
+    """
+    ratees = []
+
+    # Cas 1 : adresse = chaîne vide
+    try:
+        res_vide = (
+            supabase.table("entreprises")
+            .select("id, nom, numero_ide, adresse")
+            .eq("enrichie", True)
+            .eq("adresse", "")
+            .not_.is_("numero_ide", "null")
+            .neq("numero_ide", "")
+            .limit(limite)
+            .execute()
+        )
+        ratees.extend(res_vide.data or [])
+    except Exception as e:
+        log(f"  ⚠ recuperer_ratees (vide): {str(e)[:80]}")
+
+    # Cas 2 : adresse IS NULL (si on a encore de la place)
+    if len(ratees) < limite:
+        try:
+            res_null = (
+                supabase.table("entreprises")
+                .select("id, nom, numero_ide, adresse")
+                .eq("enrichie", True)
+                .is_("adresse", "null")
+                .not_.is_("numero_ide", "null")
+                .neq("numero_ide", "")
+                .limit(limite - len(ratees))
+                .execute()
+            )
+            ratees.extend(res_null.data or [])
+        except Exception as e:
+            log(f"  ⚠ recuperer_ratees (null): {str(e)[:80]}")
+
+    # Nettoyer : on enlève la clé "adresse" qu'on a ajoutée juste pour le filtre
+    for r in ratees:
+        r.pop("adresse", None)
+
+    return ratees[:limite]
 
 
 def enrichir_entreprise(uid: str):
