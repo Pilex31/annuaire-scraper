@@ -1,12 +1,16 @@
 """
-ANNUAIRE ROMAND — Agent de scraping v6 (sécurisé)
+ANNUAIRE ROMAND — Agent de scraping v7 (volume 1000/jour)
 ─────────────────────────────────────────────────
-Corrections v6 :
-  - LIMITE STRICTE sur le Flux 2 SOGC (max 20 nouvelles/run)
-  - Le Flux 2 fait un BREAK quand le budget de requêtes est épuisé
-  - GARDE-FOU anti-runs-multiples : si >50 entreprises déjà créées
-    aujourd'hui, le Flux 2 est sauté (le scraper a déjà tourné)
-  - Compteur de requêtes affiché en continu
+Basé sur v6 (sécurisé). Seuls les plafonds ont été relevés :
+  - MAX_ENRICHISSEMENTS : 100 → 1000 (objectif 1000 fiches/run)
+  - MAX_REQUETES_PAR_RUN : 120 → 1150 (marge pour Flux 1 + Flux 2)
+  - MAX_NOUVELLES_PAR_RUN : 20 → 100 (Flux 2 SOGC)
+  - SEUIL_ANTI_DOUBLE_RUN : 50 → 1100 (cohérent avec le nouveau volume)
+  - DELAI_ENTRE_REQUETES gardé à 3.0s (sécurité anti-blocage Zefix)
+
+⚠️ Durée estimée d'un run : ~50-60 min (1000 req × 3s).
+   Le garde-fou 429 (rate limit Zefix) reste actif : si Zefix bloque,
+   le run s'arrête proprement sans rien casser.
 """
 
 import os
@@ -29,12 +33,12 @@ ZEFIX_PASSWORD = os.environ.get("ZEFIX_PASSWORD")
 ZEFIX_BASE = "https://www.zefix.admin.ch/ZefixPublicREST/api/v1"
 
 DELAI_ENTRE_REQUETES = 3.0
-MAX_REQUETES_PAR_RUN = 120
-MAX_ENRICHISSEMENTS = 100
+MAX_REQUETES_PAR_RUN = 1150   # marge pour 1000 enrichissements + Flux 2
+MAX_ENRICHISSEMENTS = 1000    # objectif : 1000 fiches enrichies par run
 
-# ── Garde-fous v6 pour le Flux 2 (SOGC) ──
-MAX_NOUVELLES_PAR_RUN = 20    # Jamais plus de 20 nouvelles entreprises par run
-SEUIL_ANTI_DOUBLE_RUN = 50    # Si déjà >50 créées aujourd'hui, on saute le Flux 2
+# ── Garde-fous v7 pour le Flux 2 (SOGC) ──
+MAX_NOUVELLES_PAR_RUN = 100   # Jamais plus de 100 nouvelles entreprises par run
+SEUIL_ANTI_DOUBLE_RUN = 1100  # Si déjà >1100 créées aujourd'hui, on saute le Flux 2
 
 CANTONS_ROMANDS = {"GE", "VD", "VS", "FR", "NE", "JU", "BE"}
 CANTONS_NOMS = {
